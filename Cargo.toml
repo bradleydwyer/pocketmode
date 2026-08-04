@@ -1,0 +1,17 @@
+[package]
+name = "pocketmode"
+version = "0.1.0"
+edition = "2024"
+description = "Identify DJI Osmo Pocket 4P Normal, D-Log, and D-Log 2 video"
+license = "MIT"
+repository = "https://github.com/bradleydwyer/pocketmode"
+keywords = ["dji", "video", "d-log", "metadata", "cli"]
+categories = ["command-line-utilities", "multimedia::video"]
+
+[dependencies]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
