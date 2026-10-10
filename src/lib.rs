@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
+mod metadata;
+
 const COLOR_GAMMA_KEY: &[u8] = b"com.dji.camera.ColorGammaSxS";
 const D_LOG_2_SPACED: &[u8] = b"D-Log 2";
 const D_LOG_2_COMPACT: &[u8] = b"D-Log2";
@@ -95,8 +97,10 @@ pub fn inspect_reader<R: Read>(reader: R) -> io::Result<Detection> {
     inspect_reader_with_buffer(reader, SCAN_BUFFER_SIZE)
 }
 
-fn inspect_reader_with_buffer<R: Read>(mut reader: R, buffer_size: usize) -> io::Result<Detection> {
-    let counts = scan_patterns(&mut reader, buffer_size)?;
+fn inspect_reader_with_buffer<R: Read>(reader: R, buffer_size: usize) -> io::Result<Detection> {
+    let mut reader = FingerprintReader::new(reader);
+    let metadata = metadata::inspect(&mut reader, buffer_size)?;
+    let counts = reader.counts;
     let fingerprints = Fingerprints {
         color_gamma_key: counts[0],
         d_log_2: counts[1] + counts[2],
@@ -108,41 +112,21 @@ fn inspect_reader_with_buffer<R: Read>(mut reader: R, buffer_size: usize) -> io:
         yuv_gamma: counts[8],
     };
 
-    Ok(classify(fingerprints))
+    Ok(classify(fingerprints, metadata))
 }
 
-fn classify(fingerprints: Fingerprints) -> Detection {
-    let has_direct_metadata = fingerprints.color_gamma_key > 0;
-
-    let (mode, confidence, evidence) = if has_direct_metadata && fingerprints.d_log_2 > 0 {
+fn classify(fingerprints: Fingerprints, metadata: metadata::DirectMetadata) -> Detection {
+    let (mode, confidence, evidence) = if let Some(mode) = metadata.mode() {
         (
-            Mode::DLog2,
+            mode,
             Confidence::High,
-            "DJI ColorGammaSxS metadata declares D-Log 2".to_owned(),
+            format!("DJI ColorGammaSxS metadata declares {}", mode.as_str()),
         )
-    } else if has_direct_metadata && fingerprints.d_log_m > 0 {
+    } else if metadata.found {
         (
-            Mode::DLogM,
-            Confidence::High,
-            "DJI ColorGammaSxS metadata declares D-Log M".to_owned(),
-        )
-    } else if has_direct_metadata && fingerprints.d_log > 0 {
-        (
-            Mode::DLog,
-            Confidence::High,
-            "DJI ColorGammaSxS metadata declares D-Log".to_owned(),
-        )
-    } else if has_direct_metadata && fingerprints.hlg > 0 {
-        (
-            Mode::Hlg,
-            Confidence::High,
-            "DJI ColorGammaSxS metadata declares HLG".to_owned(),
-        )
-    } else if has_direct_metadata && fingerprints.normal > 0 {
-        (
-            Mode::Normal,
-            Confidence::High,
-            "DJI ColorGammaSxS metadata declares Normal".to_owned(),
+            Mode::Unknown,
+            Confidence::Low,
+            "DJI ColorGammaSxS value is missing, unsupported, or conflicting".to_owned(),
         )
     } else if fingerprints.de_gamma > 0 && fingerprints.yuv_gamma > 0 {
         (
@@ -162,12 +146,6 @@ fn classify(fingerprints: Fingerprints) -> Detection {
                 fingerprints.yuv_gamma
             ),
         )
-    } else if has_direct_metadata {
-        (
-            Mode::Unknown,
-            Confidence::Low,
-            "DJI ColorGammaSxS key found, but its value is not recognised".to_owned(),
-        )
     } else {
         (
             Mode::Unknown,
@@ -184,48 +162,55 @@ fn classify(fingerprints: Fingerprints) -> Detection {
     }
 }
 
-fn scan_patterns<R: Read>(reader: &mut R, buffer_size: usize) -> io::Result<[u64; PATTERNS.len()]> {
-    let max_pattern_len = PATTERNS
-        .iter()
-        .map(|pattern| pattern.len())
-        .max()
-        .unwrap_or(1);
-    let mut counts = [0_u64; PATTERNS.len()];
-    let mut read_buffer = vec![0_u8; buffer_size.max(1)];
-    let mut tail = Vec::with_capacity(max_pattern_len.saturating_sub(1));
-    let search_patterns: Vec<_> = PATTERNS
-        .iter()
-        .map(|pattern| SearchPattern::new(pattern))
-        .collect();
+// Count the existing diagnostic fingerprints as the atom parser reads the stream.
+struct FingerprintReader<R> {
+    inner: R,
+    counts: [u64; PATTERNS.len()],
+    tail: Vec<u8>,
+    window: Vec<u8>,
+    patterns: Vec<SearchPattern>,
+    overlap: usize,
+}
 
-    loop {
-        let bytes_read = reader.read(&mut read_buffer)?;
-        if bytes_read == 0 {
-            break;
+impl<R> FingerprintReader<R> {
+    fn new(inner: R) -> Self {
+        let overlap = PATTERNS.iter().map(|pattern| pattern.len()).max().unwrap() - 1;
+        Self {
+            inner,
+            counts: [0; PATTERNS.len()],
+            tail: Vec::with_capacity(overlap),
+            window: Vec::new(),
+            patterns: PATTERNS.iter().map(|p| SearchPattern::new(p)).collect(),
+            overlap,
         }
+    }
+}
 
-        let tail_len = tail.len();
-        let mut window = Vec::with_capacity(tail_len + bytes_read);
-        window.extend_from_slice(&tail);
-        window.extend_from_slice(&read_buffer[..bytes_read]);
+impl<R: Read> Read for FingerprintReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.inner.read(buffer)?;
+        let tail_len = self.tail.len();
+        self.window.clear();
+        self.window.extend_from_slice(&self.tail);
+        self.window.extend_from_slice(&buffer[..bytes_read]);
 
-        for (pattern_index, pattern) in search_patterns.iter().enumerate() {
+        for (pattern_index, pattern) in self.patterns.iter().enumerate() {
             let mut offset = 0;
-            while let Some(start) = pattern.find_from(&window, offset) {
+            while let Some(start) = pattern.find_from(&self.window, offset) {
                 let end = start + pattern.needle.len();
                 if end > tail_len {
-                    counts[pattern_index] += 1;
+                    self.counts[pattern_index] += 1;
                 }
                 offset = start + 1;
             }
         }
 
-        let keep = window.len().min(max_pattern_len.saturating_sub(1));
-        tail.clear();
-        tail.extend_from_slice(&window[window.len() - keep..]);
+        let keep = self.window.len().min(self.overlap);
+        self.tail.clear();
+        self.tail
+            .extend_from_slice(&self.window[self.window.len() - keep..]);
+        Ok(bytes_read)
     }
-
-    Ok(counts)
 }
 
 struct SearchPattern {
@@ -279,16 +264,56 @@ mod tests {
         inspect_reader_with_buffer(Cursor::new(bytes), 7).unwrap()
     }
 
+    fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn metadata_atom(entries: &[(&[u8], &[u8])], full_box: bool, items_first: bool) -> Vec<u8> {
+        let mut keys = vec![0; 4];
+        keys.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        let mut items = Vec::new();
+        for (index, (key, value)) in entries.iter().enumerate() {
+            keys.extend(atom(b"mdta", key));
+            let mut data = 1_u32.to_be_bytes().to_vec(); // UTF-8, default locale
+            data.extend_from_slice(&[0; 4]);
+            data.extend_from_slice(value);
+            items.extend(atom(
+                &((index + 1) as u32).to_be_bytes(),
+                &atom(b"data", &data),
+            ));
+        }
+        let keys = atom(b"keys", &keys);
+        let items = atom(b"ilst", &items);
+        let mut payload = if full_box { vec![0; 4] } else { Vec::new() };
+        if items_first {
+            payload.extend(items);
+            payload.extend(keys);
+        } else {
+            payload.extend(keys);
+            payload.extend(items);
+        }
+        atom(b"meta", &payload)
+    }
+
+    fn movie(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        atom(b"moov", &metadata_atom(entries, true, false))
+    }
+
     #[test]
     fn detects_direct_d_log_metadata_across_buffer_boundaries() {
-        let bytes = [
-            b"prefix".as_slice(),
-            COLOR_GAMMA_KEY,
-            b"\0\0D-Log\0suffix".as_slice(),
-        ]
-        .concat();
+        struct ShortReads<R>(R);
+        impl<R: Read> Read for ShortReads<R> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let len = bytes.len().min(3);
+                self.0.read(&mut bytes[..len])
+            }
+        }
+        let bytes = movie(&[(COLOR_GAMMA_KEY, b"D-Log\0")]);
 
-        let detection = inspect(&bytes);
+        let detection = inspect_reader(ShortReads(Cursor::new(bytes))).unwrap();
 
         assert_eq!(detection.mode, Mode::DLog);
         assert_eq!(detection.confidence, Confidence::High);
@@ -296,10 +321,162 @@ mod tests {
     }
 
     #[test]
-    fn prefers_d_log_2_over_the_d_log_substring() {
-        let bytes = [COLOR_GAMMA_KEY, b"\0D-Log 2"].concat();
+    fn detects_each_supported_metadata_value() {
+        for (value, expected) in [
+            ("Normal", Mode::Normal),
+            ("D-Log", Mode::DLog),
+            ("D-Log M", Mode::DLogM),
+            ("D-Log 2", Mode::DLog2),
+            ("D-Log2", Mode::DLog2),
+            ("HLG", Mode::Hlg),
+        ] {
+            let detection = inspect(&movie(&[(COLOR_GAMMA_KEY, value.as_bytes())]));
+            assert_eq!(detection.mode, expected, "{value}");
+            assert_eq!(detection.confidence, Confidence::High, "{value}");
+        }
+    }
 
-        assert_eq!(inspect(&bytes).mode, Mode::DLog2);
+    #[test]
+    fn ignores_unrelated_profile_names_in_other_metadata_and_video_data() {
+        // The camera key is index 2; index 1 contains an unrelated profile name.
+        let mut bytes = movie(&[
+            (b"com.example.comment", b"D-Log 2"),
+            (COLOR_GAMMA_KEY, b"Normal"),
+        ]);
+        bytes.extend(atom(b"mdat", b"D-Log M D-Log 2 HLG"));
+
+        let detection = inspect(&bytes);
+
+        assert_eq!(detection.mode, Mode::Normal);
+        assert_eq!(detection.confidence, Confidence::High);
+        assert_eq!(
+            detection.evidence,
+            "DJI ColorGammaSxS metadata declares Normal"
+        );
+        // Raw counts remain available for diagnostics, but do not select the mode.
+        assert_eq!(detection.fingerprints.d_log_2, 2);
+    }
+
+    #[test]
+    fn raw_key_and_mode_strings_do_not_count_as_metadata() {
+        let bytes = [COLOR_GAMMA_KEY, b"\0Normal\0unrelated D-Log 2"].concat();
+
+        assert_eq!(inspect(&bytes).mode, Mode::Unknown);
+        assert_eq!(inspect(&atom(b"mdat", &bytes)).mode, Mode::Unknown);
+    }
+
+    #[test]
+    fn supports_quicktime_and_iso_metadata_in_either_child_order() {
+        for full_box in [false, true] {
+            for items_first in [false, true] {
+                let bytes = atom(
+                    b"moov",
+                    &atom(
+                        b"udta",
+                        &metadata_atom(&[(COLOR_GAMMA_KEY, b"D-Log M")], full_box, items_first),
+                    ),
+                );
+                assert_eq!(inspect(&bytes).mode, Mode::DLogM);
+            }
+        }
+    }
+
+    #[test]
+    fn requires_an_exact_supported_value() {
+        for value in ["D-Log 20", "D-Log M extra", "Normal D-Log 2", "Custom"] {
+            let mut bytes = movie(&[(COLOR_GAMMA_KEY, value.as_bytes())]);
+            bytes.extend(atom(b"mdat", b"Normal dcc0_degamma1 yuvpp0_gamma_v1"));
+            let detection = inspect(&bytes);
+
+            assert_eq!(detection.mode, Mode::Unknown, "{value}");
+            assert_eq!(detection.confidence, Confidence::Low, "{value}");
+        }
+    }
+
+    #[test]
+    fn does_not_resolve_a_key_using_another_metadata_scope() {
+        let mut keys = vec![0; 4];
+        keys.extend_from_slice(&1_u32.to_be_bytes());
+        keys.extend(atom(b"mdta", COLOR_GAMMA_KEY));
+        let mut payload = vec![0; 4];
+        payload.extend(atom(b"keys", &keys));
+        let mut bytes = atom(b"moov", &atom(b"meta", &payload));
+        bytes.extend(movie(&[(b"com.example.comment", b"D-Log 2")]));
+
+        assert_eq!(inspect(&bytes).mode, Mode::Unknown);
+    }
+
+    #[test]
+    fn conflicting_direct_values_are_unknown() {
+        let mut bytes = movie(&[(COLOR_GAMMA_KEY, b"Normal")]);
+        bytes.extend(movie(&[(COLOR_GAMMA_KEY, b"D-Log 2")]));
+
+        let detection = inspect(&bytes);
+        assert_eq!(detection.mode, Mode::Unknown);
+        assert_eq!(detection.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn respects_the_metadata_data_type_and_text_encoding() {
+        fn typed_movie(data_type: u32, value: &[u8]) -> Vec<u8> {
+            let mut keys = vec![0; 4];
+            keys.extend_from_slice(&1_u32.to_be_bytes());
+            keys.extend(atom(b"mdta", COLOR_GAMMA_KEY));
+            let mut data = data_type.to_be_bytes().to_vec();
+            data.extend_from_slice(&[0; 4]);
+            data.extend_from_slice(value);
+            let item = atom(&1_u32.to_be_bytes(), &atom(b"data", &data));
+            let mut meta = vec![0; 4];
+            meta.extend(atom(b"keys", &keys));
+            meta.extend(atom(b"ilst", &item));
+            atom(b"moov", &atom(b"meta", &meta))
+        }
+
+        assert_eq!(
+            inspect(&typed_movie(2, b"\0N\0o\0r\0m\0a\0l")).mode,
+            Mode::Normal
+        );
+        for (data_type, value) in [
+            (21, b"Normal".as_slice()), // Integer data is not a profile declaration.
+            (1, b"Normal\xff".as_slice()), // Invalid UTF-8.
+            (2, b"\0N\0o\0r\0m\0a\0l\0".as_slice()), // Truncated UTF-16.
+        ] {
+            assert_eq!(inspect(&typed_movie(data_type, value)).mode, Mode::Unknown);
+        }
+    }
+
+    #[test]
+    fn propagates_input_errors() {
+        struct BrokenReader;
+        impl Read for BrokenReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("input failure"))
+            }
+        }
+
+        assert!(inspect_reader(BrokenReader).is_err());
+    }
+
+    #[test]
+    fn supports_extended_and_zero_sized_atoms() {
+        let meta = metadata_atom(&[(COLOR_GAMMA_KEY, b"HLG")], true, false);
+        let mut bytes = 1_u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&(meta.len() as u64 + 16).to_be_bytes());
+        bytes.extend_from_slice(&meta);
+        assert_eq!(inspect(&bytes).mode, Mode::Hlg);
+
+        let mut bytes = atom(b"moov", &meta);
+        bytes[..4].fill(0);
+        assert_eq!(inspect(&bytes).mode, Mode::Hlg);
+    }
+
+    #[test]
+    fn truncated_metadata_never_declares_a_mode() {
+        let bytes = movie(&[(COLOR_GAMMA_KEY, b"D-Log 2")]);
+        for length in 0..bytes.len() {
+            assert_eq!(inspect(&bytes[..length]).mode, Mode::Unknown, "{length}");
+        }
     }
 
     #[test]

@@ -56,8 +56,10 @@ cargo install --git https://github.com/bradleydwyer/pocketmode
 
 PocketMode streams through each file and looks for two kinds of evidence:
 
-1. DJI's `com.dji.camera.ColorGammaSxS` metadata and its declared value. This
-   directly identifies profiles such as D-Log.
+1. DJI's `com.dji.camera.ColorGammaSxS` metadata and its declared value. PocketMode
+   resolves the key's index in the QuickTime/MP4 `keys` table to its `ilst` value
+   in the same metadata container. Only an exact supported value identifies a
+   profile; unrelated text elsewhere in the file cannot select the declared mode.
 2. Older DJI debug-pipeline fingerprints. Files containing both
    `dcc0_degamma1` and `yuvpp0_gamma_v1` match the D-Log 2 reference clips used
    to develop the detector. A `yuvpp0_gamma_v1` fingerprint without the
@@ -72,6 +74,10 @@ The fallback fingerprints were established empirically from DJI Osmo Pocket 4P
 clips. DJI may change or omit them in other models or firmware versions. When
 PocketMode cannot find direct metadata or a known fingerprint, it reports
 `Unknown` instead of guessing.
+
+Missing, unsupported, or conflicting `ColorGammaSxS` values also produce `Unknown`
+instead of falling back to a pipeline fingerprint. The raw string counts in JSON
+output are diagnostic fingerprints, not parsed metadata values.
 
 ## Development
 
